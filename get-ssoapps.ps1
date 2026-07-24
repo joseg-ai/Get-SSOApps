@@ -1,19 +1,19 @@
 <#
 .SYNOPSIS
-    Exports enterprise applications with configured, observed, or candidate SSO evidence.
+    Exports enterprise applications with a factual SSO determination.
 
 .DESCRIPTION
     Combines Microsoft Graph service-principal configuration with optional, aggregated
-    Microsoft Entra sign-in activity from Log Analytics. Microsoft Entra has no single
-    authoritative "SSO enabled" property. A null preferredSingleSignOnMode can still
-    represent an older SAML application or an OIDC application, so this report records
-    evidence and confidence rather than treating null as "disabled."
+    Microsoft Entra sign-in activity from Log Analytics. Every enabled Application and
+    Legacy service principal is exported by default. Use -IncludeDisabled to include
+    disabled service principals too.
 
-    By default, only enabled applications with configured, observed, or tag-inferred
-    SSO evidence are exported. Tag inference is deliberately conservative: SAML-specific
-    tags identify SAML candidates, while the generic Entra integrated-app tag identifies
-    a candidate whose protocol still requires validation. Use -IncludeUnclassified or
-    -IncludeDisabled to broaden the report.
+    The SSO Determination column contains Yes, No, or Not verified. Yes requires an
+    explicit SAML, OIDC, or password SSO mode in Microsoft Graph, or a successful SSO
+    sign-in observed in Log Analytics. No is used only when the service principal is
+    disabled or Microsoft Graph explicitly reports that SSO isn't supported. Not verified
+    means Microsoft Graph has no mode recorded and no successful SSO activity established
+    the answer. Tags never determine the result.
 
 .PARAMETER TenantId
     Optional Microsoft Entra tenant ID. Supplying it avoids signing into the wrong tenant.
@@ -28,14 +28,11 @@
 .PARAMETER Top
     Maximum number of service principals to retrieve for a test. Zero retrieves all.
 
-.PARAMETER IncludeUnclassified
-    Includes applications without configured, observed, or tag-inferred SSO evidence.
-
 .PARAMETER IncludeDisabled
     Includes disabled service principals.
 
 .PARAMETER OutputPath
-    CSV output path. Defaults to a timestamped file beside this script.
+    CSV output path. Defaults to a timestamped file in the reports subfolder.
 
 .EXAMPLE
     .\get-ssoapps.ps1 -TenantId '00000000-0000-0000-0000-000000000000'
@@ -49,9 +46,9 @@
     Adds SSO protocols observed in the Log Analytics SigninLogs table.
 
 .EXAMPLE
-    .\get-ssoapps.ps1 -Top 25 -IncludeUnclassified
+    .\get-ssoapps.ps1 -Top 25
 
-    Runs a 25-application test and includes applications with unknown SSO state.
+    Runs a 25-application test.
 
 .NOTES
     Required:
@@ -62,12 +59,13 @@
     - Az.Accounts and Az.OperationalInsights
     - Query access to a Log Analytics workspace receiving Entra SigninLogs
 
-    Tag values are used only as inventory heuristics. They do not prove that SSO is
-    active or identify the protocol for a generic Entra integrated application.
+    Microsoft Graph documents that preferredSingleSignOnMode can be null for older SAML
+    applications and OIDC applications. The script reports that case as Not verified
+    rather than inventing a Yes or No answer.
 
     Author: Jose Guajardo
     Revised: 2026-07-24
-    Version: 8.1 - Configuration, tag inference, and observed SSO evidence
+    Version: 9.0 - Factual SSO determination and full enabled-app inventory
 #>
 
 #requires -Version 7.0
@@ -91,14 +89,11 @@ param(
     [int]$Top = 0,
 
     [Parameter()]
-    [switch]$IncludeUnclassified,
-
-    [Parameter()]
     [switch]$IncludeDisabled,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$OutputPath = (Join-Path $PSScriptRoot ("Report_SSO_Applications_{0}.csv" -f (Get-Date -Format 'yyyy-MM-dd-HHmm')))
+    [string]$OutputPath = (Join-Path (Join-Path $PSScriptRoot 'reports') ("Report_SSO_Applications_{0}.csv" -f (Get-Date -Format 'yyyy-MM-dd-HHmm')))
 )
 
 Set-StrictMode -Version Latest
@@ -155,7 +150,7 @@ function Get-ConfiguredSsoMode {
     )
 
     if ([string]::IsNullOrWhiteSpace($Mode)) {
-        return 'Unknown'
+        return 'Not recorded'
     }
 
     switch ($Mode.ToLowerInvariant()) {
@@ -182,51 +177,60 @@ function ConvertTo-ObservedProtocolLabel {
     }
 }
 
-function Get-TagSsoEvidence {
+function Get-SsoDetermination {
     [CmdletBinding()]
     param(
-        [Parameter()]
-        [AllowNull()]
-        [object[]]$Tags
+        [Parameter(Mandatory)]
+        [bool]$AccountEnabled,
+
+        [Parameter(Mandatory)]
+        [string]$ConfiguredMode,
+
+        [Parameter(Mandatory)]
+        [bool]$ActivityChecked,
+
+        [Parameter(Mandatory)]
+        [bool]$ObservedSso
     )
 
-    $tagValues = @($Tags | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-    $gallerySamlTag = 'WindowsAzureActiveDirectoryGalleryApplicationPrimaryV1'
-    $customSamlTag = 'WindowsAzureActiveDirectoryCustomSingleSignOnApplication'
-    $integratedAppTag = 'WindowsAzureActiveDirectoryIntegratedApp'
-
-    if ($tagValues -contains $gallerySamlTag) {
+    if (-not $AccountEnabled) {
         return [PSCustomObject]@{
-            Mode = 'SAML'
-            Evidence = 'Gallery SAML tag'
-            Confidence = 'Medium (tag inference)'
-            IsCandidate = $true
+            Result = 'No'
+            Basis = 'The service principal is disabled, so users cannot currently sign in.'
         }
     }
 
-    if ($tagValues -contains $customSamlTag) {
+    if ($ObservedSso) {
         return [PSCustomObject]@{
-            Mode = 'SAML'
-            Evidence = 'Non-gallery SAML tag'
-            Confidence = 'Medium (tag inference)'
-            IsCandidate = $true
+            Result = 'Yes'
+            Basis = 'A successful SSO sign-in was observed in Log Analytics.'
         }
     }
 
-    if ($tagValues -contains $integratedAppTag) {
+    if ($ConfiguredMode -in 'SAML', 'OIDC', 'Password') {
         return [PSCustomObject]@{
-            Mode = 'Entra integrated (protocol unknown)'
-            Evidence = 'Integrated application tag'
-            Confidence = 'Low (protocol requires validation)'
-            IsCandidate = $true
+            Result = 'Yes'
+            Basis = "Microsoft Graph records the configured SSO mode as $ConfiguredMode."
         }
+    }
+
+    if ($ConfiguredMode -eq 'Not supported') {
+        return [PSCustomObject]@{
+            Result = 'No'
+            Basis = 'Microsoft Graph explicitly records the SSO mode as notSupported.'
+        }
+    }
+
+    $basis = if ($ActivityChecked) {
+        'Microsoft Graph has no SSO mode recorded, and no successful SSO sign-in was observed during the selected period.'
+    }
+    else {
+        'Microsoft Graph has no SSO mode recorded, and sign-in activity was not checked.'
     }
 
     return [PSCustomObject]@{
-        Mode = 'None'
-        Evidence = 'None'
-        Confidence = 'Unknown'
-        IsCandidate = $false
+        Result = 'Not verified'
+        Basis = $basis
     }
 }
 
@@ -351,6 +355,7 @@ try {
 
     $observedByAppId = @{}
     $activitySource = 'Not queried'
+    $activityChecked = $false
 
     if (-not [string]::IsNullOrWhiteSpace($WorkspaceId)) {
         Write-Host "Querying $LookbackDays days of SSO activity from Log Analytics..." -ForegroundColor Cyan
@@ -391,6 +396,7 @@ try {
             }
 
             $activitySource = "Log Analytics ($LookbackDays days)"
+            $activityChecked = $true
             Write-Host "Observed SSO activity found for $($observedByAppId.Count) applications." -ForegroundColor Green
         }
         catch {
@@ -399,7 +405,7 @@ try {
         }
     }
     else {
-        Write-Warning 'No WorkspaceId supplied. Tag inference will identify candidates, but observed protocol and usage cannot be confirmed.'
+        Write-Warning 'No WorkspaceId supplied. The report will show Graph configuration, but observed SSO activity will be Not checked.'
     }
 
     $reportData = foreach ($app in $enterpriseApps) {
@@ -409,9 +415,6 @@ try {
         }
 
         $configuredMode = Get-ConfiguredSsoMode -Mode ([string]$app.PreferredSingleSignOnMode)
-        $hasConfiguredSso = $configuredMode -in 'SAML', 'OIDC', 'Password'
-        $tagEvidence = Get-TagSsoEvidence -Tags @($app.Tags)
-        $hasTagCandidate = $tagEvidence.IsCandidate
 
         $appId = [string]$app.AppId
         $observed = if (-not [string]::IsNullOrWhiteSpace($appId)) {
@@ -422,48 +425,26 @@ try {
         }
         $hasObservedSso = $null -ne $observed -and $observed.Protocols.Count -gt 0
 
-        if (-not $IncludeUnclassified -and -not $hasConfiguredSso -and -not $hasObservedSso -and -not $hasTagCandidate) {
-            continue
-        }
-
-        $evidence = if ($hasConfiguredSso -and $hasObservedSso) {
-            'Configured and observed'
-        }
-        elseif ($hasConfiguredSso) {
-            'Configured'
-        }
-        elseif ($hasObservedSso) {
-            'Observed only'
-        }
-        elseif ($hasTagCandidate) {
-            $tagEvidence.Evidence
-        }
-        else {
-            'Unclassified'
-        }
-
-        $confidence = if ($hasConfiguredSso -and $hasObservedSso) {
-            'High'
-        }
-        elseif ($hasConfiguredSso) {
-            'High (configuration)'
-        }
-        elseif ($hasObservedSso) {
-            'Medium (activity)'
-        }
-        elseif ($hasTagCandidate) {
-            $tagEvidence.Confidence
-        }
-        else {
-            'Unknown'
-        }
-
         $configurationConflict = $configuredMode -eq 'Not supported' -and $hasObservedSso
         $lastObservedSignIn = if ($hasObservedSso) {
             $observed.LastSignInUtc.UtcDateTime.ToString('o')
         }
         else {
             $null
+        }
+        $ssoDetermination = Get-SsoDetermination `
+            -AccountEnabled $isEnabled `
+            -ConfiguredMode $configuredMode `
+            -ActivityChecked $activityChecked `
+            -ObservedSso $hasObservedSso
+        $activityObserved = if (-not $activityChecked) {
+            'Not checked'
+        }
+        elseif ($hasObservedSso) {
+            'Yes'
+        }
+        else {
+            'No'
         }
 
         [PSCustomObject][ordered]@{
@@ -472,12 +453,11 @@ try {
             'Service Principal Object ID' = $app.Id
             'Service Principal Type' = $app.ServicePrincipalType
             'Status' = if ($isEnabled) { 'Enabled' } else { 'Disabled' }
+            'SSO Determination' = $ssoDetermination.Result
+            'SSO Determination Basis' = $ssoDetermination.Basis
             'Configured SSO Mode' = $configuredMode
-            'Tag-Inferred SSO Mode' = $tagEvidence.Mode
+            'SSO Activity Observed' = $activityObserved
             'Observed Protocols' = if ($hasObservedSso) { (@($observed.Protocols) | Sort-Object) -join ', ' } else { $null }
-            'SSO Evidence' = $evidence
-            'Confidence' = $confidence
-            'Protocol Validation Required' = if (-not $hasConfiguredSso -and -not $hasObservedSso -and $hasTagCandidate) { 'Yes' } else { 'No' }
             'Configuration Conflict' = if ($configurationConflict) { 'Yes' } else { 'No' }
             'Last Observed Sign-In (UTC)' = $lastObservedSignIn
             'Observed Sign-In Count' = if ($hasObservedSso) { $observed.Count } else { 0 }
@@ -493,7 +473,7 @@ try {
 
     $reportData = @($reportData | Sort-Object 'Application Name', 'Application (Client) ID')
     if ($reportData.Count -eq 0) {
-        Write-Warning 'No configured, observed, or tag-inferred SSO candidates matched. Use -IncludeUnclassified to export the full enabled-app inventory.'
+        Write-Warning 'No Application or Legacy service principals matched the selected options.'
         return
     }
 
@@ -505,8 +485,13 @@ try {
 
     $reportData | Export-Csv -LiteralPath $resolvedOutputPath -NoTypeInformation -Encoding UTF8 -Delimiter ';'
 
+    $ssoYesCount = @($reportData | Where-Object { $_.'SSO Determination' -eq 'Yes' }).Count
+    $ssoNoCount = @($reportData | Where-Object { $_.'SSO Determination' -eq 'No' }).Count
+    $ssoNotVerifiedCount = @($reportData | Where-Object { $_.'SSO Determination' -eq 'Not verified' }).Count
+
     Write-Host '--------------------------------------------------------' -ForegroundColor Cyan
     Write-Host "Report complete: $($reportData.Count) applications" -ForegroundColor Green
+    Write-Host "SSO determination: Yes $ssoYesCount | No $ssoNoCount | Not verified $ssoNotVerifiedCount" -ForegroundColor White
     Write-Host "Activity source: $activitySource" -ForegroundColor White
     Write-Host $resolvedOutputPath -ForegroundColor White
     Write-Host '--------------------------------------------------------' -ForegroundColor Cyan
