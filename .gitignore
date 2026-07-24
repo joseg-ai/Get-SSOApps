@@ -1,0 +1,5 @@
+# Generated tenant inventory reports
+Report_SSO_Applications_*.csv
+
+# Optional local export folder
+exports/
