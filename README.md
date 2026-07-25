@@ -28,7 +28,7 @@ Tags are exported as inventory metadata but never determine the SSO result. The 
 ## Requirements
 
 - PowerShell 7.0 or later
-- The `Microsoft.Graph.Authentication` PowerShell module
+- `Microsoft.Graph.Authentication` 2.0.0 or later
 - Delegated Microsoft Graph permission: `Application.Read.All` (administrator consent required)
 
 For optional sign-in activity enrichment:
@@ -40,12 +40,14 @@ For optional sign-in activity enrichment:
 Install the required modules for the current user:
 
 ```powershell
-Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -MinimumVersion 2.0.0
 Install-Module Az.Accounts -Scope CurrentUser
 Install-Module Az.OperationalInsights -Scope CurrentUser
 ```
 
 > Only `Microsoft.Graph.Authentication` is required when running without `-WorkspaceId`.
+
+The script selects the newest compatible installed authentication module, validates the delegated `Connect-MgGraph` parameter set, and prints both the script and module versions at startup.
 
 ## Usage
 
@@ -94,6 +96,16 @@ Without `-OutputPath`, the script creates the `reports` subfolder when needed an
 The CSV includes application and service-principal IDs, `SSO Determination`, `SSO Determination Basis`, the configured SSO mode, observed-activity status, protocols and sign-in counts when available, application status, URLs, tags, and the source of activity data.
 
 `SSO Activity Observed` is `Not checked` unless a Log Analytics workspace is supplied and its query succeeds. `Observed Sign-In Count` and `Last Observed Sign-In (UTC)` describe only the selected lookback period.
+
+## Troubleshooting
+
+### Parameter set cannot be resolved
+
+Replace the local script with the latest repository copy and start a fresh PowerShell 7 session. A current run begins by displaying `Get-SSOApps v9.1.0` and the loaded `Microsoft.Graph.Authentication` version.
+
+Messages such as `A critical error occurred during processing`, `No applications were processed to generate a report`, or `Disconnecting from the Microsoft Graph session` are not emitted by version 9.1.0 and indicate that an older or independently modified script was executed.
+
+If version 9.1.0 reports an authentication-module compatibility problem, install the latest module for the current user, close all PowerShell sessions, open PowerShell 7, and retry. New errors include the processing stage, script line, exception type, and error ID needed for diagnosis.
 
 ## Security and privacy
 

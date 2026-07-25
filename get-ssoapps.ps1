@@ -65,7 +65,7 @@
 
     Author: Jose Guajardo
     Revised: 2026-07-24
-    Version: 9.0 - Factual SSO determination and full enabled-app inventory
+    Version: 9.1.0 - Module compatibility checks and actionable diagnostics
 #>
 
 #requires -Version 7.0
@@ -98,6 +98,114 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$scriptVersion = '9.1.0'
+$minimumGraphAuthenticationVersion = [version]'2.0.0'
+$processingStage = 'initialization'
+
+function Test-CommandParameterSet {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.CommandInfo]$Command,
+
+        [Parameter(Mandatory)]
+        [string[]]$ParameterNames
+    )
+
+    foreach ($parameterSet in $Command.ParameterSets) {
+        $availableNames = @($parameterSet.Parameters | ForEach-Object { $_.Name })
+        $missingNames = @($ParameterNames | Where-Object { $_ -notin $availableNames })
+        if ($missingNames.Count -eq 0) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Import-CompatibleGraphAuthenticationModule {
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.CommandInfo])]
+    param(
+        [Parameter(Mandatory)]
+        [version]$MinimumVersion
+    )
+
+    $compatibleModules = @(Get-Module -ListAvailable -Name Microsoft.Graph.Authentication |
+            Where-Object { $_.Version -ge $MinimumVersion } |
+            Sort-Object Version -Descending)
+
+    if ($compatibleModules.Count -eq 0) {
+        throw "Microsoft.Graph.Authentication $MinimumVersion or later is required. Install the latest version for the current user, restart PowerShell, and retry."
+    }
+
+    $selectedModule = $compatibleModules[0]
+    $null = Import-Module -Name $selectedModule.Path -ErrorAction Stop
+
+    $connectCommand = Get-Command Connect-MgGraph -ErrorAction Stop
+    if ($connectCommand.Module.Version -lt $MinimumVersion) {
+        throw "PowerShell loaded Microsoft.Graph.Authentication $($connectCommand.Module.Version) from '$($connectCommand.Module.Path)', but version $MinimumVersion or later is required. Start a new PowerShell 7 session and retry."
+    }
+
+    foreach ($commandName in 'Get-MgContext', 'Invoke-MgGraphRequest', 'Disconnect-MgGraph') {
+        $command = Get-Command $commandName -ErrorAction Stop
+        if ($command.Module.Version -ne $connectCommand.Module.Version) {
+            throw "Mixed Microsoft.Graph.Authentication command versions were loaded: Connect-MgGraph is $($connectCommand.Module.Version), while $commandName is $($command.Module.Version). Start a new PowerShell 7 session and retry."
+        }
+    }
+
+    return $connectCommand
+}
+
+function Connect-GraphForReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.CommandInfo]$ConnectCommand,
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$TenantId
+    )
+
+    $connectParameters = @{
+        Scopes = [string[]]@('Application.Read.All')
+        ErrorAction = 'Stop'
+    }
+    $parameterNames = [System.Collections.Generic.List[string]]::new()
+    $parameterNames.AddRange([string[]]@('Scopes', 'ErrorAction'))
+
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $connectParameters.TenantId = $TenantId
+        $parameterNames.Add('TenantId')
+    }
+
+    foreach ($optionalParameter in @(
+            @{ Name = 'ContextScope'; Value = 'Process' }
+            @{ Name = 'NoWelcome'; Value = $true }
+        )) {
+        $candidateNames = @($parameterNames) + $optionalParameter.Name
+        if ($ConnectCommand.Parameters.ContainsKey($optionalParameter.Name) -and
+            (Test-CommandParameterSet -Command $ConnectCommand -ParameterNames $candidateNames)) {
+            $connectParameters[$optionalParameter.Name] = $optionalParameter.Value
+            $parameterNames.Add($optionalParameter.Name)
+        }
+    }
+
+    if (-not (Test-CommandParameterSet -Command $ConnectCommand -ParameterNames @($parameterNames))) {
+        $attemptedParameters = @($parameterNames) -join ', '
+        throw "Connect-MgGraph $($ConnectCommand.Module.Version) has no delegated parameter set supporting: $attemptedParameters. Install the latest Microsoft.Graph.Authentication module, restart PowerShell, and retry."
+    }
+
+    try {
+        & $ConnectCommand @connectParameters | Out-Null
+    }
+    catch [System.Management.Automation.ParameterBindingException] {
+        $attemptedParameters = @($parameterNames) -join ', '
+        throw "Connect-MgGraph parameter binding failed in Microsoft.Graph.Authentication $($ConnectCommand.Module.Version) from '$($ConnectCommand.Module.Path)'. Parameters used: $attemptedParameters. Install the latest module, restart PowerShell 7, and retry. Original error: $($_.Exception.Message)"
+    }
+}
 
 function Invoke-GraphCollectionRequest {
     [CmdletBinding()]
@@ -291,12 +399,15 @@ SigninLogs
 $graphConnectionCreated = $false
 
 try {
-    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
-        throw "Module 'Microsoft.Graph.Authentication' is required."
-    }
+    Write-Host "Get-SSOApps v$scriptVersion" -ForegroundColor Cyan
+    Write-Verbose "Script path: $PSCommandPath"
 
-    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    $processingStage = 'Microsoft Graph module validation'
+    $connectMgGraphCommand = Import-CompatibleGraphAuthenticationModule `
+        -MinimumVersion $minimumGraphAuthenticationVersion
+    Write-Host "Microsoft.Graph.Authentication $($connectMgGraphCommand.Module.Version)" -ForegroundColor DarkGray
 
+    $processingStage = 'Microsoft Graph context inspection'
     $graphContext = Get-MgContext -ErrorAction SilentlyContinue
     $hasRequiredScope = $null -ne $graphContext -and (
         $graphContext.Scopes -contains 'Application.Read.All' -or
@@ -307,19 +418,9 @@ try {
     )
 
     if ($null -eq $graphContext -or -not $hasRequiredScope -or -not $isRequestedTenant) {
+        $processingStage = 'Microsoft Graph authentication'
         Write-Host 'Connecting to Microsoft Graph...' -ForegroundColor Cyan
-        $connectParameters = @{
-            Scopes       = 'Application.Read.All'
-            ContextScope = 'Process'
-            NoWelcome    = $true
-            ErrorAction  = 'Stop'
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
-            $connectParameters.TenantId = $TenantId
-        }
-
-        Connect-MgGraph @connectParameters
+        Connect-GraphForReport -ConnectCommand $connectMgGraphCommand -TenantId $TenantId
         $graphConnectionCreated = $true
         $graphContext = Get-MgContext -ErrorAction Stop
     }
@@ -331,6 +432,7 @@ try {
     Write-Host "Connected to tenant $TenantId." -ForegroundColor Green
     Write-Host 'Retrieving Application and Legacy service principals...' -ForegroundColor Cyan
 
+    $processingStage = 'service principal retrieval'
     $properties = @(
         'id'
         'displayName'
@@ -358,6 +460,7 @@ try {
     $activityChecked = $false
 
     if (-not [string]::IsNullOrWhiteSpace($WorkspaceId)) {
+        $processingStage = 'optional Log Analytics activity query'
         Write-Host "Querying $LookbackDays days of SSO activity from Log Analytics..." -ForegroundColor Cyan
         try {
             $activityRows = @(Get-ObservedSsoActivity `
@@ -408,6 +511,7 @@ try {
         Write-Warning 'No WorkspaceId supplied. The report will show Graph configuration, but observed SSO activity will be Not checked.'
     }
 
+    $processingStage = 'SSO determination'
     $reportData = foreach ($app in $enterpriseApps) {
         $isEnabled = $app.AccountEnabled -eq $true
         if (-not $IncludeDisabled -and -not $isEnabled) {
@@ -477,6 +581,7 @@ try {
         return
     }
 
+    $processingStage = 'CSV export'
     $resolvedOutputPath = [System.IO.Path]::GetFullPath($OutputPath)
     $outputDirectory = Split-Path -Path $resolvedOutputPath -Parent
     if (-not (Test-Path -LiteralPath $outputDirectory)) {
@@ -499,10 +604,16 @@ try {
     $resolvedOutputPath
 }
 catch {
-    if ($_.Exception.Message -match 'consent|approval|AADSTS65001') {
-        Write-Error 'Admin consent is required for Application.Read.All. Ask a tenant administrator to approve Microsoft Graph Command Line Tools, then retry.'
+    $failureMessage = $_.Exception.Message
+    if ($failureMessage -match 'consent|approval|AADSTS65001') {
+        $failureMessage = 'Admin consent is required for Application.Read.All. Ask a tenant administrator to approve Microsoft Graph Command Line Tools, then retry.'
     }
-    throw
+
+    $errorType = $_.Exception.GetType().FullName
+    $errorId = if ([string]::IsNullOrWhiteSpace($_.FullyQualifiedErrorId)) { 'Unavailable' } else { $_.FullyQualifiedErrorId }
+    $lineNumber = $_.InvocationInfo.ScriptLineNumber
+    $diagnosticMessage = "Get-SSOApps v$scriptVersion failed during $processingStage at script line $lineNumber. [$errorType; $errorId] $failureMessage"
+    throw [System.InvalidOperationException]::new($diagnosticMessage, $_.Exception)
 }
 finally {
     if ($graphConnectionCreated -and $null -ne (Get-MgContext -ErrorAction SilentlyContinue)) {
