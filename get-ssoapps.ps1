@@ -64,8 +64,8 @@
     rather than inventing a Yes or No answer.
 
     Author: Jose Guajardo
-    Revised: 2026-07-24
-    Version: 9.1.0 - Module compatibility checks and actionable diagnostics
+    Revised: 2026-07-27
+    Version: 9.2.0 - Large tenant scaling, Graph throttling retries, and progress reporting
 #>
 
 #requires -Version 7.0
@@ -98,7 +98,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$scriptVersion = '9.1.0'
+$scriptVersion = '9.2.0'
 $minimumGraphAuthenticationVersion = [version]'2.0.0'
 $processingStage = 'initialization'
 
@@ -207,6 +207,101 @@ function Connect-GraphForReport {
     }
 }
 
+function Get-GraphErrorStatusCode {
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $responseProperty = $ErrorRecord.Exception.PSObject.Properties['Response']
+    if ($null -ne $responseProperty -and $null -ne $responseProperty.Value) {
+        $statusProperty = $responseProperty.Value.PSObject.Properties['StatusCode']
+        if ($null -ne $statusProperty -and $null -ne $statusProperty.Value) {
+            try {
+                return [int]$statusProperty.Value
+            }
+            catch {
+                Write-Verbose "Unable to convert the Microsoft Graph status code to an integer: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if ($ErrorRecord.Exception.Message -match '\b(429|503|504)\b') {
+        return [int]$Matches[1]
+    }
+
+    return $null
+}
+
+function Get-GraphRetryDelaySecond {
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(0, 32)]
+        [int]$Attempt
+    )
+
+    $statusCode = Get-GraphErrorStatusCode -ErrorRecord $ErrorRecord
+    if ($statusCode -notin 429, 503, 504) {
+        return $null
+    }
+
+    $responseProperty = $ErrorRecord.Exception.PSObject.Properties['Response']
+    if ($null -ne $responseProperty -and $null -ne $responseProperty.Value) {
+        $headersProperty = $responseProperty.Value.PSObject.Properties['Headers']
+        if ($null -ne $headersProperty -and $null -ne $headersProperty.Value) {
+            try {
+                $retryAfterValues = $null
+                if ($headersProperty.Value.TryGetValues('Retry-After', [ref]$retryAfterValues)) {
+                    $parsedDelay = 0
+                    if ([int]::TryParse((@($retryAfterValues)[0]), [ref]$parsedDelay) -and $parsedDelay -gt 0) {
+                        return [math]::Min($parsedDelay, 120)
+                    }
+                }
+            }
+            catch {
+                Write-Verbose "Unable to read the Retry-After header: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    return [math]::Min([math]::Pow(2, $Attempt) * 2, 60)
+}
+
+function Invoke-GraphRequestWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(0, 10)]
+        [int]$MaximumRetryCount
+    )
+
+    for ($attempt = 0; ; $attempt++) {
+        try {
+            return Invoke-MgGraphRequest -Method GET -Uri $Uri -OutputType PSObject -ErrorAction Stop
+        }
+        catch {
+            $delaySecond = Get-GraphRetryDelaySecond -ErrorRecord $_ -Attempt $attempt
+
+            if ($null -eq $delaySecond -or $attempt -ge $MaximumRetryCount) {
+                throw
+            }
+
+            Write-Warning "Microsoft Graph throttled or was unavailable. Waiting $delaySecond seconds before retry $($attempt + 1) of $MaximumRetryCount."
+            Start-Sleep -Seconds $delaySecond
+        }
+    }
+}
+
 function Invoke-GraphCollectionRequest {
     [CmdletBinding()]
     param(
@@ -215,34 +310,51 @@ function Invoke-GraphCollectionRequest {
 
         [Parameter()]
         [ValidateRange(0, 1000000)]
-        [int]$MaximumItems = 0
+        [int]$MaximumItems = 0,
+
+        [Parameter()]
+        [ValidateRange(0, 10)]
+        [int]$MaximumRetryCount = 5,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$ActivityName = 'Retrieving Microsoft Graph collection'
     )
 
     $items = [System.Collections.Generic.List[object]]::new()
     $nextLink = $Uri
+    $pageNumber = 0
 
-    while (-not [string]::IsNullOrWhiteSpace($nextLink)) {
-        $response = Invoke-MgGraphRequest -Method GET -Uri $nextLink -OutputType PSObject -ErrorAction Stop
-        $valueProperty = $response.PSObject.Properties['value']
+    try {
+        while (-not [string]::IsNullOrWhiteSpace($nextLink)) {
+            $pageNumber++
+            Write-Progress -Activity $ActivityName -Status "Page $pageNumber; $($items.Count) retrieved so far"
 
-        if ($null -eq $valueProperty) {
-            throw "Microsoft Graph returned an unexpected response for '$nextLink'."
-        }
+            $response = Invoke-GraphRequestWithRetry -Uri $nextLink -MaximumRetryCount $MaximumRetryCount
+            $valueProperty = $response.PSObject.Properties['value']
 
-        foreach ($item in @($valueProperty.Value)) {
-            [void]$items.Add($item)
-            if ($MaximumItems -gt 0 -and $items.Count -ge $MaximumItems) {
-                return $items.ToArray()
+            if ($null -eq $valueProperty) {
+                throw "Microsoft Graph returned an unexpected response for '$nextLink'."
+            }
+
+            foreach ($item in @($valueProperty.Value)) {
+                [void]$items.Add($item)
+                if ($MaximumItems -gt 0 -and $items.Count -ge $MaximumItems) {
+                    return $items.ToArray()
+                }
+            }
+
+            $nextLinkProperty = $response.PSObject.Properties['@odata.nextLink']
+            $nextLink = if ($null -ne $nextLinkProperty) {
+                [string]$nextLinkProperty.Value
+            }
+            else {
+                $null
             }
         }
-
-        $nextLinkProperty = $response.PSObject.Properties['@odata.nextLink']
-        $nextLink = if ($null -ne $nextLinkProperty) {
-            [string]$nextLinkProperty.Value
-        }
-        else {
-            $null
-        }
+    }
+    finally {
+        Write-Progress -Activity $ActivityName -Completed
     }
 
     return $items.ToArray()
@@ -448,11 +560,15 @@ try {
         'tags'
     ) -join ','
     $filter = "servicePrincipalType eq 'Application' or servicePrincipalType eq 'Legacy'"
-    $pageSize = if ($Top -gt 0 -and $Top -lt 100) { $Top } else { 100 }
+    $maximumPageSize = 999
+    $pageSize = if ($Top -gt 0 -and $Top -lt $maximumPageSize) { $Top } else { $maximumPageSize }
     $uri = 'https://graph.microsoft.com/v1.0/servicePrincipals?$select={0}&$filter={1}&$top={2}' -f `
         $properties, [System.Uri]::EscapeDataString($filter), $pageSize
 
-    $enterpriseApps = @(Invoke-GraphCollectionRequest -Uri $uri -MaximumItems $Top)
+    $enterpriseApps = @(Invoke-GraphCollectionRequest `
+            -Uri $uri `
+            -MaximumItems $Top `
+            -ActivityName 'Retrieving service principals')
     Write-Host "Retrieved $($enterpriseApps.Count) service principals." -ForegroundColor Green
 
     $observedByAppId = @{}
